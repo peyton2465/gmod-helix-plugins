@@ -1,3 +1,15 @@
+--[[
+! NOTICE ! 
+
+Page switching will not work unless you update the file:
+garrysmod/gamemodes/helix/gamemode/core/libs/thirdparty/sv_mysql.lua
+
+to the latest verson in the helix repo. The latest version has added 
+functionality which allows database querying to be more optimal. (pagination)
+--]]
+
+
+
 local PLUGIN = PLUGIN
 
 PLUGIN.name = "CharacterList"
@@ -10,6 +22,7 @@ if (SERVER) then
     util.AddNetworkString("ixCharacterListOpen")
     util.AddNetworkString("ixCharacterListRequestPage")
     util.AddNetworkString("ixCharacterListPageData")
+    util.AddNetworkString("ixCharacterListDelete")
     
     -- Page cache to avoid repeated identical queries
     -- Format: pageCache[client][cacheKey] = {data, timestamp}
@@ -158,6 +171,106 @@ if (SERVER) then
         
         QueryAndSendPage(client, page, steamIDFilter, nameFilter, cidFilter)
     end)
+
+    net.Receive("ixCharacterListDelete", function(len, client)
+        if (!client:IsSuperAdmin()) then
+            client:Kick("Attempted to delete character without permission.")
+            return
+        end
+
+        local charID = net.ReadUInt(32)
+        local page = net.ReadUInt(16)
+        local steamIDFilter = net.ReadString()
+        local nameFilter = net.ReadString()
+        local cidFilter = net.ReadString()
+
+        local query = mysql:Select("ix_characters")
+            query:Select("id")
+            query:Select("steamid")
+            query:Select("name")
+            query:Where("id", charID)
+            query:Callback(function(result)
+                if (result and #result > 0) then
+                    local charData = result[1]
+                    local characterName = charData.name
+                    local ownerSteamID = charData.steamid
+                    local ownerPlayer = player.GetBySteamID64(ownerSteamID)
+                    
+                    local character = ix.char.loaded[charID]
+                    local isCurrentChar = false
+                    
+                    if (character) then
+                        local charPlayer = character:GetPlayer()
+                        if (IsValid(charPlayer)) then
+                            isCurrentChar = charPlayer:GetCharacter() and charPlayer:GetCharacter():GetID() == charID
+                        end
+                        hook.Run("PreCharacterDeleted", ownerPlayer, character)
+                    end
+                    
+                    ix.char.loaded[charID] = nil
+                    
+                    net.Start("ixCharacterDelete")
+                        net.WriteUInt(charID, 32)
+                    net.Broadcast()
+                    
+                    local deleteQuery = mysql:Delete("ix_characters")
+                        deleteQuery:Where("id", charID)
+                        deleteQuery:Callback(function()
+                            client:Notify("Character '" .. characterName .. "' (ID: " .. charID .. ") has been deleted.")
+                            
+                            if (IsValid(ownerPlayer)) then
+                                ownerPlayer:Notify("Your character '" .. characterName .. "' has been deleted by an admin.")
+                                
+                                if (ownerPlayer.ixCharList) then
+                                    for k, v in ipairs(ownerPlayer.ixCharList) do
+                                        if (v == charID) then
+                                            table.remove(ownerPlayer.ixCharList, k)
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+
+                            -- Clear cache for the admin so they get fresh data
+                            PLUGIN.pageCache[client] = {}
+                            -- Refresh the page for them
+                            QueryAndSendPage(client, page, steamIDFilter, nameFilter, cidFilter)
+                        end)
+                    deleteQuery:Execute()
+                    
+                    local invQuery = mysql:Select("ix_inventories")
+                        invQuery:Select("inventory_id")
+                        invQuery:Where("character_id", charID)
+                        invQuery:Callback(function(invResult)
+                            if (istable(invResult)) then
+                                for _, v in ipairs(invResult) do
+                                    local itemQuery = mysql:Delete("ix_items")
+                                        itemQuery:Where("inventory_id", v.inventory_id)
+                                    itemQuery:Execute()
+                                    
+                                    ix.item.inventories[tonumber(v.inventory_id)] = nil
+                                end
+                            end
+                            
+                            local deleteInvQuery = mysql:Delete("ix_inventories")
+                                deleteInvQuery:Where("character_id", charID)
+                            deleteInvQuery:Execute()
+                        end)
+                    invQuery:Execute()
+                    
+                    hook.Run("CharacterDeleted", ownerPlayer, charID, isCurrentChar)
+                    
+                    if (isCurrentChar and IsValid(ownerPlayer)) then
+                        ownerPlayer:SetNetVar("char", nil)
+                        ownerPlayer:KillSilent()
+                        ownerPlayer:StripAmmo()
+                    end
+                else
+                    client:Notify("Character ID " .. charID .. " not found.")
+                end
+            end)
+        query:Execute()
+    end)
 end
 
 ix.command.Add("CharacterList", {
@@ -197,21 +310,21 @@ if (CLIENT) then
         filterPanel:DockMargin(4, 4, 4, 4)
         filterPanel:SetPaintBackground(false)
 
-        local steamIDLabel = filterPanel:Add("DLabel")
-        steamIDLabel:SetText("Steam ID:")
-        steamIDLabel:SetTextColor(color_white)
-        steamIDLabel:SetFont("ixSmallFont")
-        steamIDLabel:Dock(LEFT)
-        steamIDLabel:SetWide(60)
-        steamIDLabel:SetContentAlignment(6)
-        steamIDLabel:DockMargin(0, 0, 4, 0)
+        local cidLabel = filterPanel:Add("DLabel")
+        cidLabel:SetText("Char ID:")
+        cidLabel:SetTextColor(color_white)
+        cidLabel:SetFont("ixSmallFont")
+        cidLabel:Dock(LEFT)
+        cidLabel:SetWide(100)
+        cidLabel:SetContentAlignment(6)
+        cidLabel:DockMargin(0, 0, 4, 0)
 
-        self.steamIDFilter = filterPanel:Add("DTextEntry")
-        self.steamIDFilter:Dock(LEFT)
-        self.steamIDFilter:SetWide(150)
-        self.steamIDFilter:SetPlaceholderText("Filter by Steam ID...")
-        self.steamIDFilter:DockMargin(0, 4, 8, 4)
-        self.steamIDFilter.OnEnter = function()
+        self.cidFilter = filterPanel:Add("DTextEntry")
+        self.cidFilter:Dock(LEFT)
+        self.cidFilter:SetWide(100)
+        self.cidFilter:SetPlaceholderText("Filter by CID...")
+        self.cidFilter:DockMargin(0, 4, 8, 4)
+        self.cidFilter.OnEnter = function()
             self:RequestPage(1)
         end
 
@@ -220,7 +333,7 @@ if (CLIENT) then
         nameLabel:SetTextColor(color_white)
         nameLabel:SetFont("ixSmallFont")
         nameLabel:Dock(LEFT)
-        nameLabel:SetWide(45)
+        nameLabel:SetWide(80)
         nameLabel:SetContentAlignment(6)
         nameLabel:DockMargin(0, 0, 4, 0)
 
@@ -233,21 +346,21 @@ if (CLIENT) then
             self:RequestPage(1)
         end
 
-        local cidLabel = filterPanel:Add("DLabel")
-        cidLabel:SetText("Char ID:")
-        cidLabel:SetTextColor(color_white)
-        cidLabel:SetFont("ixSmallFont")
-        cidLabel:Dock(LEFT)
-        cidLabel:SetWide(50)
-        cidLabel:SetContentAlignment(6)
-        cidLabel:DockMargin(0, 0, 4, 0)
+        local steamIDLabel = filterPanel:Add("DLabel")
+        steamIDLabel:SetText("Steam ID:")
+        steamIDLabel:SetTextColor(color_white)
+        steamIDLabel:SetFont("ixSmallFont")
+        steamIDLabel:Dock(LEFT)
+        steamIDLabel:SetWide(100)
+        steamIDLabel:SetContentAlignment(6)
+        steamIDLabel:DockMargin(0, 0, 4, 0)
 
-        self.cidFilter = filterPanel:Add("DTextEntry")
-        self.cidFilter:Dock(LEFT)
-        self.cidFilter:SetWide(100)
-        self.cidFilter:SetPlaceholderText("Filter by CID...")
-        self.cidFilter:DockMargin(0, 4, 8, 4)
-        self.cidFilter.OnEnter = function()
+        self.steamIDFilter = filterPanel:Add("DTextEntry")
+        self.steamIDFilter:Dock(LEFT)
+        self.steamIDFilter:SetWide(150)
+        self.steamIDFilter:SetPlaceholderText("Filter by Steam ID...")
+        self.steamIDFilter:DockMargin(0, 4, 8, 4)
+        self.steamIDFilter.OnEnter = function()
             self:RequestPage(1)
         end
 
@@ -289,8 +402,8 @@ if (CLIENT) then
         headerPanel:SetTall(28)
         headerPanel:DockMargin(4, 0, 4, 2)
         
-        local headers = {"DB ID", "Citizen ID", "Name", "Steam ID"}
-        local widths = {0.06, 0.10, 0.35, 0.49}
+        local headers = {"DB ID", "Citizen ID", "Name", "Steam ID", "Delete"}
+        local widths = {0.06, 0.10, 0.35, 0.44, 0.04}
         
         headerPanel.Paint = function(panel, w, h)
             surface.SetDrawColor(40, 40, 40, 255)
@@ -369,13 +482,14 @@ if (CLIENT) then
     end
 
     function PANEL:UpdateList(characters, page, totalPages, totalCount)
+        local parentPanel = self
         self.characterList:Clear()
         self.characters = characters
         self.currentPage = page
         self.totalPages = totalPages
         self.totalCount = totalCount
 
-        local widths = {0.06, 0.10, 0.35, 0.49}
+        local widths = {0.06, 0.10, 0.35, 0.44, 0.04}
 
         for i, char in ipairs(characters) do
             local values = {tostring(char.id), tostring(char.cid), char.name, char.steamid}
@@ -458,6 +572,41 @@ if (CLIENT) then
                 end
                 
                 x = x + widths[j]
+            end
+
+            -- Delete button
+            local deleteBtn = row:Add("DButton")
+            deleteBtn:SetText("X")
+            deleteBtn:SetTextColor(Color(255, 100, 100))
+            deleteBtn:SetFont("ixSmallFont")
+            deleteBtn.xFrac = x
+            deleteBtn.widthFrac = widths[5]
+            deleteBtn.PerformLayout = function(self)
+                local parent = self:GetParent()
+                self:SetPos(self.xFrac * parent:GetWide(), 0)
+                self:SetSize(self.widthFrac * parent:GetWide(), parent:GetTall())
+            end
+            deleteBtn.Paint = function(self, w, h)
+                if (self:IsHovered()) then
+                    surface.SetDrawColor(255, 0, 0, 30)
+                    surface.DrawRect(0, 0, w, h)
+                end
+            end
+            deleteBtn.DoClick = function(self)
+                Derma_Query(
+                    string.format("Are you sure you want to delete character '%s' (%s)?", char.name, char.id),
+                    "Confirm Deletion",
+                    "Delete", function()
+                        net.Start("ixCharacterListDelete")
+                            net.WriteUInt(char.id, 32)
+                            net.WriteUInt(parentPanel.currentPage, 16)
+                            net.WriteString(parentPanel.steamIDFilter:GetText())
+                            net.WriteString(parentPanel.nameFilter:GetText())
+                            net.WriteString(parentPanel.cidFilter:GetText())
+                        net.SendToServer()
+                    end,
+                    "Cancel"
+                )
             end
         end
 
